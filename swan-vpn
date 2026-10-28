@@ -171,7 +171,7 @@ cmd_list() {
 cmd_add() {
     [[ $# -ge 1 ]] || usage 1
     local name=$1; shift; valid_name "$name"
-    local dnsdom= gw= user= pskfile= eapfile= noeap=0 ike=$IKE_DEFAULT esp=$ESP_DEFAULT ts=
+    local dnsdom='' gw='' user='' pskfile='' eapfile='' noeap=0 ike=$IKE_DEFAULT esp=$ESP_DEFAULT ts=''
     while [[ $# -gt 0 ]]; do
         case $1 in
             --gateway) gw=$2; shift 2;;

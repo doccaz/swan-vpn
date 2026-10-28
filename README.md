@@ -254,8 +254,8 @@ overwrite anything else in `/etc/swanctl/conf.d/`.
   `IKE_SA_INIT`; strongSwan does not. It was not needed for the gateway we tested
   against, but a gateway that uses it to pick between dial-up tunnels could behave
   differently.
-- **Not linted.** There is no test suite and `shellcheck` was not available when
-  this was written; it was tested by running it against a real gateway.
+- **No automated tests.** The script is clean under `shellcheck -s bash`, but
+  there is no test suite; it was tested by running it against a real gateway.
 
 ## Troubleshooting
 
