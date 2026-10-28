@@ -266,3 +266,7 @@ overwrite anything else in `/etc/swanctl/conf.d/`.
   `add` again without `--no-eap-secret`.
 - `sudo journalctl -u strongswan` shows the full IKE exchange.
 - If the gateway rejects the narrower traffic selectors, widen `--remote-ts`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
