@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# swan-vpn: manage IKEv2 (PSK + EAP) split tunnels with strongSwan swanctl.
+#
+# FortiGate-style flow: the gateway authenticates with a pre-shared key, the
+# client authenticates with EAP (username/password), and the gateway assigns a
+# virtual IP. Each connection gets its own XFRM interface (swan<id>): the
+# virtual IP and the routes for the tunnelled networks live on it, so only
+# traffic for those networks is encrypted, firewalld masquerade is not involved,
+# and systemd-resolved can send chosen DNS domains to the gateway's DNS server.
+set -euo pipefail
+
+CONF_DIR=/etc/swanctl/conf.d
+CHARON_DROPIN=/etc/strongswan.d/swan-vpn.conf
+MARKER='# managed-by: swan-vpn'
+IKE_DEFAULT='aes256-sha256-modp2048,aes128-sha1-modp2048'
+ESP_DEFAULT='aes256-sha256-ecp384,aes128-sha1-ecp384'
+MTU=1400
+
+die() { echo "swan-vpn: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: swan-vpn <command> [args]
+
+  up <name>           start strongswan if needed, bring the tunnel up, set routes and DNS
+  down <name>         tear the tunnel down (stops strongswan when no tunnels remain)
+  status              show daemon state, tunnels and interfaces
+  list                list connections created by this script
+  add <name> --gateway HOST --user USER --psk-file FILE --remote-ts CIDR[,CIDR] [options]
+  remove <name>       tear down and delete a connection created by this script
+
+add options:
+  --remote-ts CIDR[,CIDR]  networks reached through the tunnel (required; a full
+                           tunnel, 0.0.0.0/0, is not supported by the XFRM design)
+  --dns-domains D[,D]      send these domains, plus the reverse zones of the /8, /16
+                           and /24 networks in --remote-ts, to the gateway's DNS server
+                           (default: don't touch DNS)
+  --eap-secret-file FILE   read the EAP password from FILE (default: prompt)
+  --no-eap-secret          don't write an EAP secret (an existing one for USER is reused)
+  --ike PROPOSALS          default: $IKE_DEFAULT
+  --esp PROPOSALS          default: $ESP_DEFAULT
+EOF
+    exit "${1:-0}"
+}
+
+valid_name() { [[ $1 =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "invalid name '$1' (use a-z 0-9 _ -)"; }
+managed()    { sudo grep -qsF "$MARKER" "$CONF_DIR/$1.conf"; }
+meta()       { sudo sed -nE "s/^# swan-vpn:$2=(.*)/\1/p" "$CONF_DIR/$1.conf" | head -1; } # name key
+
+# Interface, address and route state is torn down by deleting the XFRM interface.
+iface_of() { local id; id=$(meta "$1" if-id); [[ -n $id ]] && echo "swan$id"; }
+
+ensure_dropin() {
+    # charon must not put the virtual IP on a physical interface; we place it on swan<id>
+    if ! sudo grep -qs 'install_virtual_ip = no' "$CHARON_DROPIN"; then
+        printf 'charon {\n    install_virtual_ip = no\n}\n' | sudo install -m 644 -o root -g root /dev/stdin "$CHARON_DROPIN"
+        systemctl is-active --quiet strongswan && sudo systemctl restart strongswan
+    fi
+    return 0
+}
+
+daemon_up() {
+    ensure_dropin
+    systemctl is-active --quiet strongswan || sudo systemctl start strongswan
+    for _ in 1 2 3 4 5; do sudo swanctl --stats >/dev/null 2>&1 && return; sleep 1; done
+    die "strongswan did not come up"
+}
+
+load_all() { sudo swanctl --load-all --noprompt 2>&1 | grep -E 'loaded|unloaded|fail|error|invalid' | grep -v 'opening directory' || true; }
+
+# first CHILD_SA name configured under connection $1
+child_of() {
+    sudo swanctl --list-conns 2>/dev/null | awk -v n="$1:" '
+        $1 == n && /IKEv2/ {on=1; next}
+        on && /^[^ ]/ {exit}
+        on && /^  [^ ]+: (TUNNEL|TRANSPORT)/ {sub(":","",$1); print $1; exit}'
+}
+
+# virtual IP assigned to the established IKE_SA $1 (shown in brackets on the local line)
+vip_of() {
+    sudo swanctl --list-sas --ike "$1" 2>/dev/null \
+        | sed -nE "s/^ +local +'[^']*' +@ +[0-9.]+\[[0-9]+\] +\[([0-9.]+)\].*/\1/p" | head -1
+}
+
+# reverse (in-addr.arpa) zones for the /8, /16 and /24 networks in a CIDR list
+rev_zones() {
+    local c ip n a b d
+    for c in ${1//,/ }; do
+        ip=${c%/*}; n=${c#*/}; IFS=. read -r a b d _ <<<"$ip"
+        case $n in
+            8)  echo "$a.in-addr.arpa";;
+            16) echo "$b.$a.in-addr.arpa";;
+            24) echo "$d.$b.$a.in-addr.arpa";;
+        esac
+    done
+}
+
+iface_setup() { # name vip
+    local name=$1 vip=$2 id ifc ts domains zones c dns
+    id=$(meta "$name" if-id); ifc="swan$id"
+    ts=$(meta "$name" remote-ts); domains=$(meta "$name" dns-domains)
+    sudo ip addr replace "$vip/32" dev "$ifc"
+    for c in ${ts//,/ }; do sudo ip route replace "$c" dev "$ifc" src "$vip"; done
+    echo "swan-vpn: $ifc has $vip; routes: ${ts//,/ }"
+    if [[ -n $domains ]]; then
+        dns=$(sudo awk '/^nameserver/ {print $2}' /run/strongswan/resolv.conf 2>/dev/null | tr '\n' ' ')
+        if [[ -z $dns ]]; then echo "swan-vpn: gateway assigned no DNS server"; return 0; fi
+        zones=$(rev_zones "$ts" | sed 's/^/~/' | tr '\n' ' ')
+        # shellcheck disable=SC2086
+        sudo resolvectl dns "$ifc" $dns
+        # shellcheck disable=SC2046,SC2086
+        sudo resolvectl domain "$ifc" $(printf '~%s ' ${domains//,/ }) $zones
+        sudo resolvectl default-route "$ifc" no
+        echo "swan-vpn: DNS ${dns}used only for: ${domains//,/ } $zones"
+    fi
+}
+
+cmd_up() {
+    [[ $# -eq 1 ]] || usage 1
+    local name=$1 child vip id ifc
+    valid_name "$name"
+    managed "$name" || die "'$name' was not created by swan-vpn (see: swan-vpn list)"
+    id=$(meta "$name" if-id)
+    [[ -n $id ]] || die "'$name' predates the XFRM design; recreate it with: swan-vpn remove $name && swan-vpn add ..."
+    ifc="swan$id"
+    daemon_up
+    load_all >/dev/null
+    child=$(child_of "$name")
+    [[ -n $child ]] || die "connection '$name' not found (see: swan-vpn list)"
+    ip link show "$ifc" >/dev/null 2>&1 || sudo ip link add "$ifc" type xfrm dev lo if_id "$id"
+    sudo ip link set "$ifc" mtu "$MTU" up
+    sudo swanctl --list-sas --ike "$name" 2>/dev/null | grep -q ESTABLISHED \
+        || sudo swanctl --initiate --child "$child" --ike "$name" 2>&1 | grep -E '^\[IKE\].*(established|failed|no EAP)|^initiate failed|^\[IKE\] received' || true
+    sudo swanctl --list-sas --ike "$name" 2>/dev/null | grep -q ESTABLISHED || die "tunnel '$name' did not come up"
+    vip=$(vip_of "$name")
+    [[ -n $vip ]] || die "tunnel is up but I could not read the virtual IP"
+    iface_setup "$name" "$vip"
+    echo "swan-vpn: '$name' is up (virtual IP $vip)"
+}
+
+cmd_down() {
+    [[ $# -eq 1 ]] || usage 1
+    local name=$1 ifc=
+    ifc=$(iface_of "$name" 2>/dev/null || true)
+    systemctl is-active --quiet strongswan && sudo swanctl --terminate --ike "$name" 2>&1 | grep -E 'terminate|fail' || true
+    if [[ -n $ifc ]] && ip link show "$ifc" >/dev/null 2>&1; then sudo ip link del "$ifc"; fi
+    if systemctl is-active --quiet strongswan && ! sudo swanctl --list-sas 2>/dev/null | grep -q ESTABLISHED; then
+        sudo systemctl stop strongswan
+        echo "swan-vpn: '$name' is down, strongswan stopped (no tunnels left)"
+    else
+        echo "swan-vpn: '$name' is down"
+    fi
+}
+
+cmd_status() {
+    echo "strongswan: $(systemctl is-active strongswan || true)"
+    if systemctl is-active --quiet strongswan; then
+        sudo swanctl --list-sas 2>/dev/null | grep -E '^[^ ]|bytes' | cut -c1-120 || true
+    fi
+    echo "interfaces:"
+    ip -br addr show type xfrm 2>/dev/null | sed 's/^/  /'
+}
+
+cmd_list() {
+    local f
+    for f in $(sudo ls "$CONF_DIR" 2>/dev/null | grep -E '\.conf$' | grep -v -- '-eap\.conf$'); do
+        sudo grep -qsF "$MARKER" "$CONF_DIR/$f" && echo "${f%.conf}"
+    done || true
+}
+
+cmd_add() {
+    [[ $# -ge 1 ]] || usage 1
+    local name=$1; shift; valid_name "$name"
+    local dnsdom= gw= user= pskfile= eapfile= noeap=0 ike=$IKE_DEFAULT esp=$ESP_DEFAULT ts=
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --gateway) gw=$2; shift 2;;
+            --user) user=$2; shift 2;;
+            --psk-file) pskfile=$2; shift 2;;
+            --eap-secret-file) eapfile=$2; shift 2;;
+            --no-eap-secret) noeap=1; shift;;
+            --ike) ike=$2; shift 2;;
+            --esp) esp=$2; shift 2;;
+            --remote-ts) ts=$2; shift 2;;
+            --dns-domains) dnsdom=$2; shift 2;;
+            *) die "unknown option '$1'";;
+        esac
+    done
+    [[ -n $gw && -n $user && -n $pskfile && -n $ts ]] || die "--gateway, --user, --psk-file and --remote-ts are required"
+    [[ $ts != *0.0.0.0/0* ]] || die "a full tunnel (0.0.0.0/0) is not supported: the ESP packets to the gateway would be routed into the tunnel"
+    [[ -r $pskfile ]] || die "cannot read $pskfile"
+    if sudo test -e "$CONF_DIR/$name.conf" && ! managed "$name"; then
+        die "$CONF_DIR/$name.conf exists and was not created by swan-vpn; refusing to overwrite"
+    fi
+
+    local psk; psk=$(tr -d '\r\n' < "$pskfile")
+    [[ -n $psk && $psk != *\"* && $psk != *\\* ]] || die "PSK is empty or contains \" or \\ (unsupported)"
+
+    local rid=%any sid=
+    if [[ $gw =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then rid=$gw; sid="id = $gw"; fi
+
+    # XFRM interface id, stable per connection name (100-999)
+    local id; id=$(printf '%s' "$name" | cksum | awk '{print 100 + $1 % 900}')
+
+    # PSK goes in via stdin so it never appears on a command line
+    {
+        cat <<EOF
+$MARKER
+# swan-vpn:if-id=$id
+# swan-vpn:remote-ts=$ts
+# swan-vpn:dns-domains=$dnsdom
+connections {
+    $name {
+        version = 2
+        remote_addrs = $gw
+        vips = 0.0.0.0
+        encap = yes
+        proposals = $ike
+        local {
+            auth = eap
+            id = $user
+            eap_id = $user
+        }
+        remote {
+            auth = psk
+            id = $rid
+        }
+        children {
+            $name {
+                remote_ts = $ts
+                esp_proposals = $esp
+                if_id_in = $id
+                if_id_out = $id
+                start_action = none
+                dpd_action = restart
+            }
+        }
+    }
+}
+secrets {
+    ike-$name {
+        $sid
+        secret = "$psk"
+    }
+}
+EOF
+    } | sudo install -m 600 -o root -g root /dev/stdin "$CONF_DIR/$name.conf"
+
+    if [[ $noeap -eq 0 ]]; then
+        local pw
+        if [[ -n $eapfile ]]; then
+            pw=$(tr -d '\r\n' < "$eapfile")
+        else
+            read -rsp "EAP password for $user: " pw; echo
+        fi
+        [[ -n $pw && $pw != *\"* && $pw != *\\* ]] || { sudo rm -f "$CONF_DIR/$name.conf"; die "password is empty or contains \" or \\ (unsupported)"; }
+        printf '%s\nsecrets {\n    eap-%s {\n        id = "%s"\n        secret = "%s"\n    }\n}\n' "$MARKER" "$name" "$user" "$pw" \
+            | sudo install -m 600 -o root -g root /dev/stdin "$CONF_DIR/$name-eap.conf"
+    fi
+    echo "swan-vpn: connection '$name' written to $CONF_DIR (gateway $gw, user $user, interface swan$id)"
+    if systemctl is-active --quiet strongswan; then load_all; fi
+}
+
+cmd_remove() {
+    [[ $# -eq 1 ]] || usage 1
+    local name=$1; valid_name "$name"
+    managed "$name" || die "'$name' was not created by swan-vpn"
+    cmd_down "$name" || true
+    sudo rm -f "$CONF_DIR/$name.conf" "$CONF_DIR/$name-eap.conf"
+    if systemctl is-active --quiet strongswan; then load_all >/dev/null; fi
+    echo "swan-vpn: connection '$name' removed"
+}
+
+[[ $# -ge 1 ]] || usage 1
+cmd=$1; shift
+case $cmd in
+    up) cmd_up "$@";;
+    down) cmd_down "$@";;
+    status) cmd_status "$@";;
+    list) cmd_list;;
+    add) cmd_add "$@";;
+    remove) cmd_remove "$@";;
+    -h|--help|help) usage 0;;
+    *) usage 1;;
+esac
